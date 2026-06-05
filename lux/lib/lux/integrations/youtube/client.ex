@@ -146,6 +146,55 @@ defmodule Lux.Integrations.YouTube.Client do
   end
 
   @doc """
+  Builds a chunk upload request for an established resumable upload session.
+
+  The upload URL must be the `Location` response header returned by the initial
+  resumable videos.insert request.
+  """
+  @spec resumable_chunk_request(map()) :: map()
+  def resumable_chunk_request(opts) do
+    upload_url = fetch!(opts, :upload_url)
+    content_length = fetch_integer!(opts, :content_length)
+    range_start = get_integer(opts, :range_start, 0)
+    range_end = get_integer(opts, :range_end, range_start + content_length - 1)
+    total_length = get_integer(opts, :total_length, content_length)
+
+    %{
+      method: :put,
+      url: upload_url,
+      query: %{},
+      headers:
+        upload_session_headers(get(opts, :access_token, nil), [
+          {"Content-Type", get(opts, :content_type, "video/mp4")},
+          {"Content-Length", to_string(content_length)},
+          {"Content-Range", "bytes #{range_start}-#{range_end}/#{total_length}"}
+        ]),
+      body: get(opts, :body, :video_binary)
+    }
+  end
+
+  @doc """
+  Builds a status probe request for resuming an interrupted upload session.
+  """
+  @spec resumable_resume_request(map()) :: map()
+  def resumable_resume_request(opts) do
+    upload_url = fetch!(opts, :upload_url)
+    total_length = fetch_integer!(opts, :total_length)
+
+    %{
+      method: :put,
+      url: upload_url,
+      query: %{},
+      headers:
+        upload_session_headers(get(opts, :access_token, nil), [
+          {"Content-Length", "0"},
+          {"Content-Range", "bytes */#{total_length}"}
+        ]),
+      body: ""
+    }
+  end
+
+  @doc """
   Returns the default OAuth scopes needed for channel, upload, live, and chat APIs.
   """
   @spec default_scopes() :: [String.t()]
@@ -184,6 +233,12 @@ defmodule Lux.Integrations.YouTube.Client do
     ]
   end
 
+  defp upload_session_headers(nil, headers), do: headers
+
+  defp upload_session_headers(access_token, headers) do
+    [{"Authorization", "Bearer #{access_token}"} | headers]
+  end
+
   defp normalize_query(query) do
     query
     |> Enum.reject(fn {_key, value} -> is_nil(value) or value == "" end)
@@ -216,6 +271,33 @@ defmodule Lux.Integrations.YouTube.Client do
       value -> value
     end
   end
+
+  defp fetch_integer!(map, key) do
+    case integer(fetch!(map, key)) do
+      nil -> raise ArgumentError, "invalid YouTube option #{key}"
+      value -> value
+    end
+  end
+
+  defp get_integer(map, key, default) do
+    case integer(get(map, key, default)) do
+      nil -> default
+      value -> value
+    end
+  end
+
+  defp integer(value) when is_integer(value), do: value
+  defp integer(value) when is_float(value), do: trunc(value)
+
+  defp integer(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {number, ""} -> number
+      {number, rest} -> if String.trim(rest) == "", do: number, else: nil
+      _ -> nil
+    end
+  end
+
+  defp integer(_value), do: nil
 
   defp maybe_add_plug(options, nil), do: options
   defp maybe_add_plug(options, plug), do: Keyword.put(options, :plug, plug)

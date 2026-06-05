@@ -88,4 +88,37 @@ defmodule Lux.Integrations.YouTube.ClientTest do
       assert {"X-Upload-Content-Length", "123456"} in request.headers
     end
   end
+
+  describe "resumable upload session helpers" do
+    test "builds chunk upload and resume probe requests against the Location URL" do
+      chunk =
+        Client.resumable_chunk_request(%{
+          access_token: "token",
+          upload_url: "https://upload.youtube.test/session",
+          content_type: "video/mp4",
+          content_length: "256",
+          range_start: 0,
+          total_length: "1024"
+        })
+
+      assert chunk.method == :put
+      assert chunk.url == "https://upload.youtube.test/session"
+      assert {"Authorization", "Bearer token"} in chunk.headers
+      assert {"Content-Length", "256"} in chunk.headers
+      assert {"Content-Range", "bytes 0-255/1024"} in chunk.headers
+      assert chunk.body == :video_binary
+
+      resume =
+        Client.resumable_resume_request(%{
+          upload_url: "https://upload.youtube.test/session",
+          total_length: "1024"
+        })
+
+      assert resume.method == :put
+      assert resume.url == "https://upload.youtube.test/session"
+      assert {"Content-Length", "0"} in resume.headers
+      assert {"Content-Range", "bytes */1024"} in resume.headers
+      assert resume.body == ""
+    end
+  end
 end

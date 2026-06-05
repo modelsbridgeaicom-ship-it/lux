@@ -118,22 +118,33 @@ defmodule Lux.Integrations.YouTube.LiveStreaming do
   """
   @spec transition_plan(map()) :: map()
   def transition_plan(params) do
-    broadcast_id = get(params, :broadcast_id, nil)
     current = get(params, :current_life_cycle_status, "ready")
     target = get(params, :target_life_cycle_status, "testing")
     allowed = Map.get(@allowed_transitions, current, [])
 
-    %{
-      allowed: target in allowed,
-      current_life_cycle_status: current,
-      target_life_cycle_status: target,
-      request:
-        Client.build_request(:post, "/liveBroadcasts/transition", %{
-          access_token: get(params, :access_token, nil),
-          query: %{broadcast_status: target, id: broadcast_id, part: "status"}
-        }),
-      guardrails: transition_guardrails(current, target, allowed)
-    }
+    case required_values(params, [:broadcast_id]) do
+      {:ok, %{broadcast_id: broadcast_id}} ->
+        %{
+          allowed: target in allowed,
+          current_life_cycle_status: current,
+          target_life_cycle_status: target,
+          request:
+            Client.build_request(:post, "/liveBroadcasts/transition", %{
+              access_token: get(params, :access_token, nil),
+              query: %{broadcast_status: target, id: broadcast_id, part: "status"}
+            }),
+          guardrails: transition_guardrails(current, target, allowed)
+        }
+
+      {:error, error, missing} ->
+        %{
+          allowed: false,
+          current_life_cycle_status: current,
+          target_life_cycle_status: target,
+          request: guarded_request(:transition_broadcast, error, missing),
+          guardrails: [error | transition_guardrails(current, target, allowed)]
+        }
+    end
   end
 
   defp oauth_plan(params) do
@@ -168,11 +179,20 @@ defmodule Lux.Integrations.YouTube.LiveStreaming do
           content_type: get(params, :content_type, "video/mp4"),
           content_length: get(params, :content_length, 0)
         }),
+      upload_session: %{
+        source: "Location response header from resumable_start",
+        required_parameter: :upload_url,
+        note: "Use the returned upload session URL for all chunk and resume requests."
+      },
+      chunk_upload: chunk_upload_plan(params),
+      resume_probe: resume_probe_plan(params),
       status_request:
-        Client.build_request(:get, "/videos", %{
-          access_token: get(params, :access_token, nil),
-          query: %{part: "snippet,status,liveStreamingDetails", id: get(params, :video_id, nil)}
-        })
+        guarded_request(params, [:video_id], :video_status, fn %{video_id: video_id} ->
+          Client.build_request(:get, "/videos", %{
+            access_token: get(params, :access_token, nil),
+            query: %{part: "snippet,status,liveStreamingDetails", id: video_id}
+          })
+        end)
     }
   end
 
@@ -195,6 +215,8 @@ defmodule Lux.Integrations.YouTube.LiveStreaming do
         recordFromStart: get(params, :record_from_start, true)
       }
     }
+
+    body = prune_empty_values(body)
 
     %{
       insert:
@@ -229,45 +251,72 @@ defmodule Lux.Integrations.YouTube.LiveStreaming do
           json: body
         }),
       status:
-        Client.build_request(:get, "/liveStreams", %{
-          access_token: get(params, :access_token, nil),
-          query: %{part: "snippet,cdn,status", id: get(params, :stream_id, nil)}
-        })
+        guarded_request(params, [:stream_id], :stream_status, fn %{stream_id: stream_id} ->
+          Client.build_request(:get, "/liveStreams", %{
+            access_token: get(params, :access_token, nil),
+            query: %{part: "snippet,cdn,status", id: stream_id}
+          })
+        end)
     }
   end
 
   defp bind_plan(params) do
-    Client.build_request(:post, "/liveBroadcasts/bind", %{
-      access_token: get(params, :access_token, nil),
-      query: %{
-        id: get(params, :broadcast_id, nil),
-        stream_id: get(params, :stream_id, nil),
-        part: "id,contentDetails"
-      }
-    })
+    guarded_request(params, [:broadcast_id, :stream_id], :bind_broadcast, fn values ->
+      %{broadcast_id: broadcast_id, stream_id: stream_id} = values
+
+      Client.build_request(:post, "/liveBroadcasts/bind", %{
+        access_token: get(params, :access_token, nil),
+        query: %{
+          id: broadcast_id,
+          stream_id: stream_id,
+          part: "id,contentDetails"
+        }
+      })
+    end)
   end
 
   defp live_chat_plan(params) do
-    chat_id = get(params, :live_chat_id, nil)
-
     %{
       list:
-        Client.build_request(:get, "/liveChat/messages", %{
-          access_token: get(params, :access_token, nil),
-          query: %{live_chat_id: chat_id, part: "snippet,authorDetails", max_results: 200}
-        }),
+        guarded_request(
+          params,
+          [:live_chat_id],
+          :list_live_chat_messages,
+          fn %{live_chat_id: chat_id} ->
+            Client.build_request(:get, "/liveChat/messages", %{
+              access_token: get(params, :access_token, nil),
+              query: %{
+                live_chat_id: chat_id,
+                part: "snippet,authorDetails",
+                max_results: get(params, :live_chat_max_results, 200),
+                page_token: get(params, :live_chat_page_token, nil)
+              }
+            })
+          end
+        ),
       send:
-        Client.build_request(:post, "/liveChat/messages", %{
-          access_token: get(params, :access_token, nil),
-          query: %{part: "snippet"},
-          json: %{
-            snippet: %{
-              liveChatId: chat_id,
-              type: "textMessageEvent",
-              textMessageDetails: %{messageText: get(params, :chat_message, "")}
-            }
-          }
-        }),
+        guarded_request(
+          params,
+          [:live_chat_id],
+          :send_live_chat_message,
+          fn %{live_chat_id: chat_id} ->
+            Client.build_request(:post, "/liveChat/messages", %{
+              access_token: get(params, :access_token, nil),
+              query: %{part: "snippet"},
+              json: %{
+                snippet: %{
+                  liveChatId: chat_id,
+                  type: "textMessageEvent",
+                  textMessageDetails: %{messageText: get(params, :chat_message, "")}
+                }
+              }
+            })
+          end
+        ),
+      pagination: %{
+        next_page_token: :from_youtube_response,
+        polling_interval_millis: :from_youtube_response
+      },
       moderation: analyze_chat_messages(get(params, :chat_messages, []), params)
     }
   end
@@ -275,10 +324,12 @@ defmodule Lux.Integrations.YouTube.LiveStreaming do
   defp health_monitor_plan(params) do
     %{
       request:
-        Client.build_request(:get, "/liveStreams", %{
-          access_token: get(params, :access_token, nil),
-          query: %{part: "status", id: get(params, :stream_id, nil)}
-        }),
+        guarded_request(params, [:stream_id], :stream_health, fn %{stream_id: stream_id} ->
+          Client.build_request(:get, "/liveStreams", %{
+            access_token: get(params, :access_token, nil),
+            query: %{part: "status", id: stream_id}
+          })
+        end),
       snapshot: health_snapshot(get(params, :health, %{}))
     }
   end
@@ -318,6 +369,60 @@ defmodule Lux.Integrations.YouTube.LiveStreaming do
     if all_present?(params, keys), do: Client.token_request(type, params), else: nil
   end
 
+  defp chunk_upload_plan(params) do
+    with {:ok, values} <- required_values(params, [:upload_url, :content_length]),
+         {:ok, content_length} <- positive_integer(values.content_length, :content_length) do
+      range_start = integer(get(params, :chunk_start, 0))
+
+      Client.resumable_chunk_request(%{
+        access_token: get(params, :access_token, nil),
+        upload_url: values.upload_url,
+        content_type: get(params, :content_type, "video/mp4"),
+        content_length: content_length,
+        range_start: range_start,
+        range_end: get(params, :chunk_end, range_start + content_length - 1),
+        total_length: get(params, :total_length, content_length)
+      })
+    else
+      {:error, error, missing} when is_list(missing) ->
+        guarded_request(:upload_video_chunk, error, missing)
+
+      {:error, error, key} -> guarded_request(:upload_video_chunk, error, [key])
+    end
+  end
+
+  defp resume_probe_plan(params) do
+    with {:ok, values} <- required_values(params, [:upload_url, :total_length]),
+         {:ok, total_length} <- positive_integer(values.total_length, :total_length) do
+      Client.resumable_resume_request(%{
+        access_token: get(params, :access_token, nil),
+        upload_url: values.upload_url,
+        total_length: total_length
+      })
+    else
+      {:error, error, missing} when is_list(missing) ->
+        guarded_request(:resume_upload_session, error, missing)
+
+      {:error, error, key} -> guarded_request(:resume_upload_session, error, [key])
+    end
+  end
+
+  defp guarded_request(params, keys, operation, fun) do
+    case required_values(params, keys) do
+      {:ok, values} -> fun.(values)
+      {:error, error, missing} -> guarded_request(operation, error, missing)
+    end
+  end
+
+  defp guarded_request(operation, error, missing) do
+    %{
+      operation: operation,
+      executable: false,
+      error: error,
+      required_parameters: missing
+    }
+  end
+
   defp all_present?(params, keys) do
     Enum.all?(keys, fn key ->
       value = get(params, key, nil)
@@ -346,6 +451,21 @@ defmodule Lux.Integrations.YouTube.LiveStreaming do
     end
   end
 
+  defp required_values(params, keys) do
+    missing = Enum.filter(keys, &missing_param?(params, &1))
+
+    case missing do
+      [] -> {:ok, Map.new(keys, fn key -> {key, get(params, key, nil)} end)}
+      [key] -> {:error, "Missing required YouTube live parameter #{key}", [key]}
+      keys -> {:error, "Missing required YouTube live parameters #{Enum.join(keys, ", ")}", keys}
+    end
+  end
+
+  defp missing_param?(params, key) do
+    value = get(params, key, nil)
+    is_nil(value) or value == ""
+  end
+
   defp params_list(params, key) do
     case get(params, key, []) do
       value when is_list(value) -> value
@@ -372,6 +492,34 @@ defmodule Lux.Integrations.YouTube.LiveStreaming do
 
   defp maybe_issue(issues, issue, true), do: [issue | issues]
   defp maybe_issue(issues, _issue, false), do: issues
+
+  defp prune_empty_values(value) when is_map(value) do
+    value
+    |> Enum.reject(fn {_key, value} -> is_nil(value) or value == "" end)
+    |> Map.new(fn {key, value} -> {key, prune_empty_values(value)} end)
+  end
+
+  defp prune_empty_values(value) when is_list(value), do: Enum.map(value, &prune_empty_values/1)
+  defp prune_empty_values(value), do: value
+
+  defp positive_integer(value, key) do
+    case integer(value) do
+      number when number > 0 -> {:ok, number}
+      _ -> {:error, "Missing required YouTube live parameter #{key}", key}
+    end
+  end
+
+  defp integer(value) when is_integer(value), do: value
+  defp integer(value) when is_float(value), do: trunc(value)
+
+  defp integer(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {number, rest} -> if String.trim(rest) == "", do: number, else: 0
+      :error -> 0
+    end
+  end
+
+  defp integer(_value), do: 0
 
   defp numeric(value) when is_integer(value), do: value
   defp numeric(value) when is_float(value), do: value
